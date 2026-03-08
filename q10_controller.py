@@ -1097,17 +1097,9 @@ function setupJoystick(zoneId, thumbId, valuesId, onChange) {
   function end(e) {
     if (!active) return;
     active = false;
-    if (zoneId === 'rightStick') {
-      // Right stick: return to center (pitch/roll)
-      updateThumb(0.5, 0.5);
-      onChange(128, 128, valuesEl);
-    } else {
-      // Left stick: center yaw (X), but keep throttle (Y) where it is
-      const currentY = parseFloat(thumb.style.top) / 100 || 1.0;
-      updateThumb(0.5, currentY);
-      const yVal = Math.round(currentY * 255);
-      onChange(128, yVal, valuesEl);
-    }
+    // Both sticks: return to center on release
+    updateThumb(0.5, 0.5);
+    onChange(128, 128, valuesEl);
   }
 
   // Initialize left stick thumb at center (128 throttle)
@@ -1204,9 +1196,10 @@ document.addEventListener('keydown', (e) => {
 document.addEventListener('keyup', (e) => {
   keysDown.delete(e.key.toLowerCase());
   if (keysDown.size === 0) {
-    // When all keys released: center yaw/pitch/roll, but KEEP throttle
-    queueJoystick({ throttle: currentThrottle, yaw: 128, pitch: 128, roll: 128 });
-    document.getElementById('tThrottle').textContent = currentThrottle;
+    // When all keys released: center everything including throttle
+    currentThrottle = 128;
+    queueJoystick({ throttle: 128, yaw: 128, pitch: 128, roll: 128 });
+    document.getElementById('tThrottle').textContent = 128;
     document.getElementById('tYaw').textContent = 128;
     document.getElementById('tPitch').textContent = 128;
     document.getElementById('tRoll').textContent = 128;
@@ -1629,33 +1622,43 @@ def api_test_ramp():
             steps.append("connected")
             print(f"  TEST RAMP: Connected — ramping IMMEDIATELY")
 
-            # Step 2: Ramp up IMMEDIATELY after connect (within armed window!)
-            print(f"  TEST RAMP: Ramping to 0x{target_throttle:02X}...")
-            ramp_steps = 10
-            for i in range(1, ramp_steps + 1):
-                t = int(target_throttle * i / ramp_steps)
-                drone.set_joystick(throttle=t)
-                actual = drone.throttle
-                msg = f"ramp {i}/{ramp_steps}: set=0x{t:02X} actual=0x{actual:02X}"
-                steps.append(msg)
-                print(f"  TEST RAMP: {msg}")
-                time.sleep(0.2)
+            # Step 2: LAUNCH — two pump sequence: 0xFF→0x80, wait 2s, 0xFF→0x80
+            drone.set_joystick(throttle=0xFF)
+            steps.append("pump 1: T=0xFF")
+            print(f"  TEST RAMP: Pump 1: T=0xFF")
+            time.sleep(0.05)
+            drone.set_joystick(throttle=0x80)
+            steps.append("pump 1: T=0x80")
+            print(f"  TEST RAMP: Pump 1: T=0x80")
 
-            # Step 4: Hold
+            print(f"  TEST RAMP: Waiting 2s...")
+            time.sleep(2.0)
+
+            drone.set_joystick(throttle=0xFF)
+            steps.append("pump 2: T=0xFF")
+            print(f"  TEST RAMP: Pump 2: T=0xFF")
+            time.sleep(0.05)
+            drone.set_joystick(throttle=0x80)
+            steps.append("pump 2: T=0x80")
+            print(f"  TEST RAMP: Pump 2: T=0x80")
+
+            # Hold at cruise
+            time.sleep(0.5)
+            drone.set_joystick(throttle=target_throttle)
             print(f"  TEST RAMP: Holding at 0x{target_throttle:02X} for {hold_secs}s...")
             print(f"  TEST RAMP: >>> MOTORS SHOULD BE SPINNING NOW <<<")
             steps.append(f"holding {hold_secs}s at 0x{target_throttle:02X}...")
             time.sleep(hold_secs)
 
-            # Step 5: Ramp down
+            # Ramp down to center
             print(f"  TEST RAMP: Ramping down...")
-            for i in range(ramp_steps, 0, -1):
-                t = int(target_throttle * i / ramp_steps)
+            for i in range(10, 0, -1):
+                t = int(target_throttle * i / 10)
                 drone.set_joystick(throttle=t)
                 time.sleep(0.1)
-            drone.set_joystick(throttle=0)
+            drone.set_joystick(throttle=0x80)
             steps.append("ramp down complete")
-            print(f"  TEST RAMP: Done — throttle back to zero")
+            print(f"  TEST RAMP: Done — throttle back to center")
             print(f"{'='*50}\n")
 
         except Exception as e:

@@ -161,7 +161,7 @@ class AutopilotController:
             time.sleep(0.5)
         self.drone.connect()
         self.drone.set_joystick(roll=CENTER, pitch=CENTER, yaw=CENTER,
-                                throttle=THROTTLE_OFF)
+                                throttle=CENTER)
         msg = f"Step 2: Connected (armed={self.drone.armed}, handshake={self.drone._handshake_done})"
         print(f"  [2/6] {msg[8:]}")
         self._log_event(msg)
@@ -183,35 +183,38 @@ class AutopilotController:
         else:
             print("  [4/6] Video decoder already running")
 
-        # Step 5: Ramp throttle — NO cmd=1 takeoff command.
-        print(f"  [5/6] Ramping throttle 0x00 → 0x{self.cruise_throttle:02X} "
-              f"(10 steps, 2 seconds)...")
-        self._log_event(f"Step 5: Ramping throttle 0x00 → 0x{self.cruise_throttle:02X}...")
-        log.info("Autopilot: ramping throttle from zero to cruise (0x%02X)...",
-                 self.cruise_throttle)
+        # Step 5: LAUNCH — two full-throttle pumps to start motors.
+        # Pump 1: 0xFF → 0x80, wait 2s, Pump 2: 0xFF → 0x80, then cruise.
+        print(f"  [5/6] LAUNCH: pump 0xFF→0x80, wait 2s, pump 0xFF→0x80...")
+        self._log_event("Step 5: LAUNCH — two pump sequence...")
 
-        ramp_steps = 10
-        for i in range(1, ramp_steps + 1):
-            if self._stop_event.is_set():
-                print("  [5/6] ABORTED — stop event set")
-                self.starting = False
-                return
-            t = int(self.cruise_throttle * i / ramp_steps)
-            self.drone.set_joystick(throttle=t)
-            actual = self.drone.throttle
-            print(f"  [5/6] Ramp step {i:2d}/10: set=0x{t:02X} "
-                  f"actual=0x{actual:02X} "
-                  f"armed={self.drone.armed} "
-                  f"handshake={self.drone._handshake_done}")
-            log.info("Throttle ramp: step %d/%d set=0x%02X actual=0x%02X",
-                     i, ramp_steps, t, actual)
-            time.sleep(0.20)  # 200ms per step = 2 seconds total ramp
+        # Pump 1: full throttle then back to center
+        self.drone.set_joystick(throttle=0xFF)
+        print(f"  [5/6] Pump 1: T=0xFF")
+        time.sleep(0.05)
+        self.drone.set_joystick(throttle=0x80)
+        print(f"  [5/6] Pump 1: T=0x80")
 
-        print(f"  [5/6] Ramp complete — throttle at 0x{self.drone.throttle:02X}")
-        print(f"         >>> MOTORS SHOULD BE SPINNING NOW <<<")
-        self._log_event(f"Step 5: Ramp complete — throttle=0x{self.drone.throttle:02X}")
-        log.info("Throttle at cruise: 0x%02X (drone.throttle=0x%02X)",
-                 self.cruise_throttle, self.drone.throttle)
+        # Wait 2 seconds
+        print(f"  [5/6] Waiting 2s...")
+        time.sleep(2.0)
+        if self._stop_event.is_set():
+            self.starting = False
+            return
+
+        # Pump 2: full throttle then back to center
+        self.drone.set_joystick(throttle=0xFF)
+        print(f"  [5/6] Pump 2: T=0xFF")
+        time.sleep(0.05)
+        self.drone.set_joystick(throttle=0x80)
+        print(f"  [5/6] Pump 2: T=0x80")
+
+        # Set cruise throttle
+        time.sleep(0.5)
+        self.drone.set_joystick(throttle=self.cruise_throttle)
+        print(f"  [5/6] Launch complete — cruising at 0x{self.drone.throttle:02X}")
+        self._log_event(f"Step 5: Launch complete — cruise=0x{self.drone.throttle:02X}")
+        log.info("Throttle at cruise: 0x%02X", self.drone.throttle)
 
         # Step 6: Mark as enabled and start autopilot control loop
         # Set enabled=True AFTER ramp completes, not before
@@ -248,7 +251,7 @@ class AutopilotController:
                 self.drone.set_joystick(throttle=t)
                 time.sleep(0.1)
         self.drone.set_joystick(roll=CENTER, pitch=CENTER, yaw=CENTER,
-                                throttle=THROTTLE_OFF)
+                                throttle=CENTER)
         if was_enabled:
             log.info("Autopilot DISABLED (ticks=%d, avoidance=%d, had_video=%s)",
                      self.ticks, self.avoidance_events, self.has_video)
