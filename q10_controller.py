@@ -28,6 +28,10 @@ import numpy as np
 from autopilot.video_pipeline import VideoDecoder
 from autopilot.obstacle_detector import ObstacleDetector
 from autopilot.autopilot_controller import AutopilotController
+try:
+    from ml.data_collector import DataCollector
+except ImportError:
+    DataCollector = None
 
 # ---------------------------------------------------------------------------
 # Protocol constants (reverse-engineered from stock HASAKEE Q10 app)
@@ -35,7 +39,7 @@ from autopilot.autopilot_controller import AutopilotController
 DRONE_IP = "192.168.169.1"
 COMMAND_PORT = 8800
 VIDEO_PORT = 8801           # Second port for heartbeats (stock app sends to both)
-CONTROL_RATE = 0.05         # 20 Hz (50ms)
+CONTROL_RATE = 0.03         # ~33 Hz (30ms) — stock app sends at ~35Hz
 
 # The stock iPhone app sends from 192.168.169.3.
 # When a Mac connects to the drone WiFi it typically gets .2 instead of .3.
@@ -69,6 +73,7 @@ class Q10Controller:
         self.connected = False
         self.armed = False
         self._handshake_done = False  # Track if handshake is complete
+        self._joystick_active = False  # True when full joystick block (0x66...0x99) should be sent
 
         # Joystick state
         # Roll/Pitch/Yaw: centered at 0x80 (128)
@@ -92,6 +97,8 @@ class Q10Controller:
 
         # Sequence counter for EF 02 packets
         self._seq = 0
+        # Secondary sequence counter (bytes 88-91 in 112+ byte packets)
+        self._seq2 = 0
 
         # Pending text commands
         self._pending_text_cmds = []
@@ -114,6 +121,14 @@ class Q10Controller:
     def _open_socket(self):
         if self.sock is None:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # Maximize receive buffer for video packets (~1080B each)
+            try:
+                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+            except OSError:
+                pass
+            actual_buf = self.sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+            self.log.info("Socket receive buffer: %d KB", actual_buf // 1024)
             self.sock.settimeout(2)
             # Bind to the same IP + source port the stock app uses
             # This is critical: the drone may only accept commands from .3
@@ -162,41 +177,29 @@ class Q10Controller:
     # -- packet builders (EF 02 protocol from stock app) --------------------
 
     def _control_packet(self, sub_type=0, include_joystick=True) -> bytes:
-        """Build an EF 02 control packet matching the stock app format.
+        """Build an EF 02 control packet matching the stock app's three states.
 
-        sub_type 0: 88 bytes (basic / init)
-        sub_type 1: 112 bytes (with joystick, used during flight)
+        The stock app capture reveals THREE protocol states:
 
-        IMPORTANT: During handshake, the stock app sends packets with ALL ZEROS
-        in the joystick block (bytes 16-25). Joystick data only appears AFTER
-        the handshake is complete and the sequence counter starts incrementing.
+        1. INIT (during handshake): byte 16=0x00, seq=0, all joystick zeros
+        2. MARKER-ONLY (settle phase): byte 16=0x08 with seq incrementing,
+           but NO 0x66/0x99 joystick block — joystick bytes stay at 0x00
+        3. FULL (active flight): byte 16=0x08, 0x66/joystick/0x99, seq incrementing
 
-        Layout (confirmed from stock app capture):
-          Byte  0:     0xEF (magic)
-          Byte  1:     0x02 (control type)
-          Bytes 2-3:   packet length (LE16)
-          Bytes 4-7:   protocol header 02 02 00 01
-          Byte  8:     sub-type
-          Bytes 9-11:  00 00 00
-          Bytes 12-13: sequence counter (LE16)
-          Bytes 14-15: 00 00
-          Byte  16:    0x08 (joystick data marker) — ONLY after handshake
-          Byte  17:    0x00
-          Byte  18:    0x66 (joystick block start)
-          Byte  19:    Roll      (0x00=left, 0x80=center, 0xFF=right)
-          Byte  20:    Pitch     (0x00=forward, 0x80=center, 0xFF=back)
-          Byte  21:    Throttle  (0x00=zero, 0x80=hover, 0xFF=full)
-          Byte  22:    Yaw       (0x00=CCW, 0x80=center, 0xFF=CW)
-          Bytes 23-24: trim values 0x40 0x40
-          Byte  25:    0x99 (joystick block end)
-          Bytes 82-85: device signature 32 4B 14 2D (in 88-byte packets)
+        State transitions:
+          _handshake_done=False                → State 1 (INIT)
+          _handshake_done=True, _joystick_active=False → State 2 (MARKER-ONLY)
+          _handshake_done=True, _joystick_active=True  → State 3 (FULL)
+
+        Sub_type=2 packets have a 16-byte footer after the sensor record:
+          {seq2+1}(LE32) 00 00 00 00 03 00 00 00 10 00 00 00
         """
         if sub_type == 0:
             pkt_len = 88
         elif sub_type == 1:
             pkt_len = 112
         elif sub_type == 2:
-            pkt_len = 128
+            pkt_len = 128  # 112 + 16-byte footer
         else:
             pkt_len = 88
 
@@ -216,31 +219,27 @@ class Q10Controller:
         # Sub-type
         buf[8] = sub_type
 
-        # Sequence counter (LE16 at bytes 12-13)
-        # During handshake: stays at 0 (stock app behavior)
-        # After handshake: increments with each packet
+        # --- Three protocol states for bytes 12-25 ---
         if include_joystick and self._handshake_done:
+            # States 2 and 3: seq incrementing, byte 16 = 0x08
             struct.pack_into("<H", buf, 12, self._seq & 0xFFFF)
             self._seq += 1
-
-            # Joystick data block — only after handshake
-            # Apply trim offsets to roll/pitch center
-            # pitch_trim > 0 = forward (decrease pitch byte since 0x00=forward)
-            # roll_trim > 0 = right (increase roll byte since 0xFF=right)
-            trimmed_pitch = max(0, min(255, self.pitch - self.pitch_trim))
-            trimmed_roll = max(0, min(255, self.roll + self.roll_trim))
-
             buf[16] = 0x08  # joystick data marker
-            buf[17] = 0x00
-            buf[18] = 0x66  # block start
-            buf[19] = trimmed_roll
-            buf[20] = trimmed_pitch
-            buf[21] = self.throttle
-            buf[22] = self.yaw
-            buf[23] = self.proto_trim_roll   # protocol trim byte
-            buf[24] = self.proto_trim_pitch  # protocol trim byte
-            buf[25] = 0x99  # block end
-        # else: bytes 12-25 stay as zeros (init mode)
+
+            if self._joystick_active:
+                # State 3 (FULL): complete joystick block with 0x66...0x99
+                trimmed_pitch = max(0, min(255, self.pitch - self.pitch_trim))
+                trimmed_roll = max(0, min(255, self.roll + self.roll_trim))
+                buf[18] = 0x66  # block start
+                buf[19] = trimmed_roll
+                buf[20] = trimmed_pitch
+                buf[21] = self.throttle
+                buf[22] = self.yaw
+                buf[23] = self.proto_trim_roll
+                buf[24] = self.proto_trim_pitch
+                buf[25] = 0x99  # block end
+            # else: State 2 (MARKER-ONLY): byte 16=0x08, bytes 18-25 stay zeros
+        # else: State 1 (INIT): bytes 12-25 all zeros
 
         # Device signature at bytes 82-85 (for packets >= 86 bytes)
         if pkt_len >= 86:
@@ -248,6 +247,35 @@ class Q10Controller:
             buf[83] = 0x4B
             buf[84] = 0x14
             buf[85] = 0x2D
+
+        # Extended fields at bytes 86-111 (for 112+ byte packets)
+        # Record format (24 bytes): seq2(4) + zeros(4) + flag(4) + length(4) + sensor(8)
+        # Preceded by 2-byte preamble (00 00)
+        if pkt_len >= 112:
+            # Bytes 86-87: preamble (00 00)
+            # Bytes 88-91: secondary LE32 sequence counter
+            struct.pack_into("<I", buf, 88, self._seq2 & 0xFFFFFFFF)
+            # Bytes 92-95: 00 00 00 00
+            # Byte 96: flag — stock app always sets to 0x01 (critical for video!)
+            buf[96] = 0x01
+            # Bytes 100-103: record length (0x18=24, self-describing)
+            buf[100] = 0x18
+            # Bytes 104-111: sensor/gyro data
+            # Stock app uses ff ff ff ff 00 00 e0 ff (not all 0xff!)
+            buf[104:108] = b'\xff\xff\xff\xff'
+            buf[108:112] = b'\x00\x00\xe0\xff'
+
+        # Sub_type=2 footer: 16 bytes at bytes 112-127
+        # Stock app always includes this: {seq2+1}(LE32) + zeros(4) + type=3(LE32) + len=0x10(LE32)
+        if sub_type == 2 and pkt_len >= 128:
+            struct.pack_into("<I", buf, 112, (self._seq2 + 1) & 0xFFFFFFFF)
+            # Bytes 116-119: 00 00 00 00
+            struct.pack_into("<I", buf, 120, 3)  # type = 3
+            struct.pack_into("<I", buf, 124, 0x10)  # length = 16
+
+        # Increment seq2 AFTER both record and footer use it
+        if pkt_len >= 112:
+            self._seq2 += 1
 
         return bytes(buf)
 
@@ -285,13 +313,19 @@ class Q10Controller:
                 if data[0:1] == b'\x93':
                     self.video_packets += 1
                     # Feed video packets to decoder (for autopilot and UI)
-                    if self.video_decoder._started:
-                        self.video_decoder.feed_packet(data)
+                    self.video_decoder.feed_packet(data)
                     if self.video_packets == 1:
                         self.log.info("Video stream started from %s (%d bytes)", addr, len(data))
-                    elif self.video_packets % 1000 == 0:
-                        self.log.info("Video: %d packets received (decoded: %d frames)",
-                                      self.video_packets, self.video_decoder.frames_decoded)
+                    elif self.video_packets <= 300 and self.video_packets % 50 == 0:
+                        self.log.info("Video: %d pkts, %d frames, %d assembled (%d bytes payload)",
+                                      self.video_packets, self.video_decoder.frames_decoded,
+                                      self.video_decoder._assembler.frames_assembled,
+                                      len(data))
+                    elif self.video_packets % 500 == 0:
+                        self.log.info("Video: %d pkts, %d frames decoded, assembler: %d assembled, %d frags",
+                                      self.video_packets, self.video_decoder.frames_decoded,
+                                      self.video_decoder._assembler.frames_assembled,
+                                      self.video_decoder._assembler.fragments_received)
                 else:
                     # Log first few non-video responses, then only every 100th
                     self._rx_other = getattr(self, '_rx_other', 0) + 1
@@ -307,19 +341,24 @@ class Q10Controller:
     # -- heartbeat loop -----------------------------------------------------
 
     def _heartbeat_loop(self):
-        """Send heartbeat (stream init) to ports 8800 and 8801 every ~200ms.
-        Stock app sends to both ports during operation."""
-        beat = 0
+        """Video stats monitor. No keepalive needed — stock app uses only control packets."""
+        self.log.info("Video monitor started")
+        cycle = 0
+        last_video_pkts = 0
         while not self._stop_event.is_set():
-            try:
-                self._send(STREAM_INIT)
-                # Also send to port 8801 every other beat (stock app does this)
-                if beat % 2 == 0:
-                    self._send2(STREAM_INIT, VIDEO_PORT)
-            except Exception as e:
-                self.log.warning("Heartbeat failed: %s", e)
-            beat += 1
-            self._stop_event.wait(0.2)
+            self._stop_event.wait(2.0)
+            if self._stop_event.is_set():
+                break
+            cycle += 1
+            delta = self.video_packets - last_video_pkts
+            last_video_pkts = self.video_packets
+            self.log.info("Video stats [%ds]: pkts=%d (+%d), frames=%d, assembled=%d, "
+                          "state=%s",
+                          cycle * 2, self.video_packets, delta,
+                          self.video_decoder.frames_decoded,
+                          self.video_decoder._assembler.frames_assembled,
+                          "INIT" if not self._handshake_done else (
+                              "FULL" if self._joystick_active else "MARKER"))
 
     # -- control loop -------------------------------------------------------
 
@@ -339,24 +378,36 @@ class Q10Controller:
                         self._send(cmd_pkt)
                         time.sleep(0.02)
 
-                    # Alternate between 88-byte (sub_type=0) and 112-byte (sub_type=1)
-                    # The stock app sends a mix of both
-                    sub = 0 if (tick % 3 == 0) else 1
+                    # Mix sub_types 0, 1, 2 matching stock app distribution:
+                    # ~47% sub_type=0 (88B), ~41% sub_type=1 (112B), ~12% sub_type=2 (128B+)
+                    r = tick % 8
+                    if r == 7:
+                        sub = 2
+                    elif r % 2 == 0:
+                        sub = 0
+                    else:
+                        sub = 1
                     pkt = self._control_packet(sub_type=sub)
                     self._send(pkt)
 
-                    # Diagnostic packet logging:
-                    # - First 3 packets always
-                    # - Every 500th packet when idle
-                    # - Every 10th packet when throttle > 0 (during ramp/flight)
-                    should_log = (tick < 3 or tick % 500 == 0 or
-                                  (self.throttle > 0 and tick % 10 == 0))
+                    # Diagnostic packet logging
+                    should_log = (tick < 3 or
+                                  (tick < 500 and tick % 100 == 0) or
+                                  tick % 1000 == 0 or
+                                  (self.throttle > 0x80 and tick % 50 == 0))
                     if should_log:
+                        ext = ""
+                        if len(pkt) >= 128:
+                            ext = f" ext[86:128]={pkt[86:128].hex(' ')}"
+                        elif len(pkt) >= 112:
+                            ext = f" ext[86:112]={pkt[86:112].hex(' ')}"
+                        state = "INIT" if not self._handshake_done else (
+                            "FULL" if self._joystick_active else "MARKER")
                         self.log.info(
-                            "TX pkt[%d] sub=%d seq=%d bytes[16:26]=%s "
-                            "T=0x%02X R=0x%02X P=0x%02X Y=0x%02X",
-                            tick, sub, self._seq, pkt[16:26].hex(' '),
-                            self.throttle, self.roll, self.pitch, self.yaw)
+                            "TX pkt[%d] sub=%d seq=%d state=%s [16:26]=%s "
+                            "T=0x%02X%s",
+                            tick, sub, self._seq, state, pkt[16:26].hex(' '),
+                            self.throttle, ext)
                     tick += 1
                     errors = 0  # Reset error counter on success
                 except Exception as e:
@@ -400,9 +451,21 @@ class Q10Controller:
         self._open_socket()
         self._stop_event.clear()
         self._seq = 0
+        self._seq2 = 0
         self._handshake_done = False
+        self._joystick_active = False
+
+        # Start video decoder BEFORE handshake so it's ready when 0x93 packets arrive
+        if not self.video_decoder._started:
+            try:
+                self.video_decoder.start()
+                self.log.info("Video decoder pre-started for incoming packets")
+            except Exception as e:
+                self.log.warning("Video decoder failed to start: %s", e)
 
         # Step 1: Heartbeats to BOTH ports (matching stock app exactly)
+        # Stock app uses port 54288 for 8800 and a DIFFERENT port (53169) for 8801
+        # Only 2 STREAM_INIT packets go to 8801 during entire session
         self.log.info("Step 1: Sending stream init to ports 8800 + 8801...")
         self._send(STREAM_INIT)                     # +0ms -> :8800
         self._send2(STREAM_INIT, VIDEO_PORT)         # +9ms -> :8801
@@ -455,21 +518,37 @@ class Q10Controller:
         self._send(self._text_command_packet(106))
         time.sleep(0.05)
 
-        # Mark handshake as done - now control packets will include joystick data
-        self._handshake_done = True
-        self.log.info("Handshake complete — starting continuous control")
+        # CRITICAL: Stock app capture shows it sends ALL-ZERO control packets
+        # (seq=0, byte16=0x00, no joystick) for ~2.5 seconds (82 packets!) after
+        # the handshake commands, BEFORE transitioning to byte16=0x08 + joystick.
+        # Video flows continuously during this all-zero phase.
+        # Setting _handshake_done immediately was killing video because the drone
+        # expects this idle period first.
+        self._handshake_done = False   # Keep sending State 1 (all-zero) packets
+        self._joystick_active = False
 
-        # Start heartbeat loop (200ms, both ports)
+        # Start monitor thread
         self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
         self._heartbeat_thread.start()
 
-        # Start control loop (20Hz)
+        # Start control loop (33Hz) — sends State 1 (all-zero) packets
         self._control_thread = threading.Thread(target=self._control_loop, daemon=True)
         self._control_thread.start()
 
         self.connected = True
         self.armed = True
-        self.log.info("Connected — sending heartbeat (200ms) + control (20Hz)")
+        self.log.info("Handshake done — sending all-zero idle packets (State 1), "
+                      "transitioning to joystick in 2.5s")
+
+        # After 2.5s (matching stock app timing), transition to State 3
+        def _activate_joystick():
+            self._handshake_done = True
+            self._joystick_active = True
+            self.log.info("State 1 complete → State 3 (seq incrementing + full joystick block)")
+
+        self._settle_timer = threading.Timer(2.5, _activate_joystick)
+        self._settle_timer.daemon = True
+        self._settle_timer.start()
 
     def disconnect(self):
         """Stop all loops and close sockets."""
@@ -478,6 +557,8 @@ class Q10Controller:
             self.autopilot.disable()
         if self.video_decoder._started:
             self.video_decoder.stop()
+        if hasattr(self, '_settle_timer') and self._settle_timer:
+            self._settle_timer.cancel()
         self._stop_event.set()
         self.connected = False
         self.armed = False
@@ -608,6 +689,8 @@ class Q10Controller:
             "pitch_trim": self.pitch_trim,
             "roll_trim": self.roll_trim,
             "video_packets": self.video_packets,
+            "video_fps": round(self.video_decoder.fps, 1),
+            "video_frames_decoded": self.video_decoder.frames_decoded,
         }
 
 
@@ -617,6 +700,19 @@ class Q10Controller:
 
 app = Flask(__name__)
 drone = Q10Controller()
+
+# ML subsystems (optional — controller works without ml/ package)
+ml_collector = DataCollector(drone.video_decoder, drone) if DataCollector else None
+ml_predictor = None  # Initialized lazily when first needed
+ml_trainer = None    # Created on-demand per training run
+
+def _get_predictor():
+    global ml_predictor
+    if ml_predictor is None:
+        from ml.predictor import Predictor
+        ml_predictor = Predictor()
+        drone.autopilot.set_predictor(ml_predictor)
+    return ml_predictor
 
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="en">
@@ -866,6 +962,17 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- Camera Feed -->
+  <div class="panel" style="grid-column: 1 / -1;">
+    <div class="panel-title">Camera Feed</div>
+    <div style="text-align:center;">
+      <img id="videoFeed" style="width:100%; max-width:480px; border-radius:8px; border:1px solid var(--border); background:#000;">
+      <div style="font-size:11px; color:var(--muted); margin-top:6px;">
+        FPS: <span id="videoFps">0</span> &nbsp;|&nbsp; Frames: <span id="videoFrames">0</span>
+      </div>
+    </div>
+  </div>
+
   <!-- Left stick: Throttle / Yaw -->
   <div class="panel">
     <div class="panel-title">Left Stick &mdash; Throttle / Yaw</div>
@@ -921,6 +1028,7 @@ HTML_PAGE = """<!DOCTYPE html>
       <button class="btn btn-sm ap-btn active" id="btnAPOff" onclick="setAutopilot('off')">OFF (Manual)</button>
       <button class="btn btn-sm ap-btn" id="btnAPHover" onclick="setAutopilot('hover')">Hover + Avoid</button>
       <button class="btn btn-sm ap-btn" id="btnAPExplore" onclick="setAutopilot('explore')">Explore</button>
+      <button class="btn btn-sm ap-btn" id="btnAPML" onclick="setAutopilot('ml')" style="background:#537; border-color:#759;">ML Pilot</button>
       <button class="btn btn-sm" id="btnTestRamp" onclick="doTestRamp()" style="background:#553; border-color:#885; color:#ee8;">Test Ramp</button>
       <span style="font-size:12px; color:var(--muted); margin-left:8px;" id="apStatus">Autopilot off</span>
     </div>
@@ -928,11 +1036,6 @@ HTML_PAGE = """<!DOCTYPE html>
     <div id="apEventLog" style="display:none; background:#111; border:1px solid var(--border); border-radius:6px; padding:8px 12px; margin-bottom:12px; max-height:150px; overflow-y:auto; font-family:monospace; font-size:11px; line-height:1.6; color:#8f8;">
     </div>
     <div style="display:flex; gap:16px; align-items:flex-start; flex-wrap:wrap;">
-      <!-- Video feed -->
-      <div style="flex:1; min-width:200px;">
-        <div style="font-size:11px; color:var(--muted); margin-bottom:4px;">Camera Feed</div>
-        <img id="videoFeed" src="/api/video/frame" style="width:100%; max-width:320px; border-radius:8px; border:1px solid var(--border); background:#000;">
-      </div>
       <!-- Threat levels -->
       <div style="flex:1; min-width:180px;">
         <div style="font-size:11px; color:var(--muted); margin-bottom:4px;">Obstacle Threat</div>
@@ -962,6 +1065,55 @@ HTML_PAGE = """<!DOCTYPE html>
         <div style="font-size:11px; color:var(--muted); margin-top:8px;">
           Frames: <span id="apFrames">0</span> &nbsp;|&nbsp; Avoidance: <span id="apAvoid">0</span>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ML Behavioral Cloning -->
+  <div class="panel" style="grid-column: 1 / -1;">
+    <div class="panel-title">ML Behavioral Cloning</div>
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px;">
+      <!-- Recording -->
+      <div>
+        <div style="font-size:12px; color:var(--muted); margin-bottom:8px;">Record Flight Data</div>
+        <div style="display:flex; gap:6px; align-items:center; margin-bottom:8px;">
+          <input type="text" id="mlSessionName" placeholder="Session name" style="flex:1; padding:6px 10px; border:1px solid var(--border); border-radius:6px; background:var(--bg); color:var(--text); font-size:13px;">
+          <button class="btn btn-sm btn-success" id="btnRecord" onclick="mlToggleRecord()">Record</button>
+        </div>
+        <div id="mlRecordStatus" style="font-size:11px; color:var(--muted);">Not recording</div>
+        <!-- Sessions list -->
+        <div style="font-size:12px; color:var(--muted); margin:10px 0 6px;">Sessions</div>
+        <div id="mlSessionsList" style="background:var(--bg); border-radius:6px; padding:6px; max-height:120px; overflow-y:auto; font-size:12px;">
+          <div style="color:var(--muted);">No sessions</div>
+        </div>
+      </div>
+      <!-- Training & Models -->
+      <div>
+        <div style="font-size:12px; color:var(--muted); margin-bottom:8px;">Train Model</div>
+        <div style="display:flex; gap:6px; margin-bottom:8px;">
+          <button class="btn btn-sm btn-primary" id="btnTrain" onclick="mlStartTrain()">Train Selected</button>
+          <button class="btn btn-sm btn-danger" id="btnTrainStop" onclick="mlStopTrain()" style="display:none;">Stop</button>
+        </div>
+        <div id="mlTrainStatus" style="font-size:11px; color:var(--muted); margin-bottom:8px;">Idle</div>
+        <div id="mlTrainProgress" style="display:none; margin-bottom:8px;">
+          <div style="height:6px; background:var(--bg); border-radius:3px; overflow:hidden;">
+            <div id="mlTrainBar" style="height:100%; width:0%; background:var(--accent); transition:width 0.3s;"></div>
+          </div>
+          <div style="font-size:10px; color:var(--muted); margin-top:2px;">
+            Epoch <span id="mlTrainEpoch">0</span>/<span id="mlTrainTotal">50</span>
+            | Loss: <span id="mlTrainLoss">-</span> / <span id="mlValLoss">-</span>
+          </div>
+        </div>
+        <!-- Models list -->
+        <div style="font-size:12px; color:var(--muted); margin:4px 0 6px;">Models</div>
+        <div id="mlModelsList" style="background:var(--bg); border-radius:6px; padding:6px; max-height:100px; overflow-y:auto; font-size:12px;">
+          <div style="color:var(--muted);">No models</div>
+        </div>
+        <div style="display:flex; gap:6px; margin-top:6px;">
+          <button class="btn btn-sm" id="btnLoadModel" onclick="mlLoadModel()">Load Selected</button>
+          <button class="btn btn-sm" id="btnUnloadModel" onclick="mlUnloadModel()">Unload</button>
+        </div>
+        <div id="mlModelInfo" style="font-size:11px; color:var(--muted); margin-top:4px;">No model loaded</div>
       </div>
     </div>
   </div>
@@ -1028,11 +1180,12 @@ async function api(path, body) {
 async function doConnect() {
   addLog('Connecting to drone...');
   const r = await api('connect', {});
-  if (r.ok) { addLog('Connected!', 'ok'); updateUI(true); }
+  if (r.ok) { addLog('Connected!', 'ok'); updateUI(true); startVideoStream(); }
   else { addLog('Connection failed: ' + (r.error || ''), 'error'); }
 }
 
 async function doDisconnect() {
+  stopVideoStream();
   const r = await api('disconnect', {});
   addLog('Disconnected', 'warn');
   updateUI(false);
@@ -1249,12 +1402,15 @@ setInterval(async () => {
       document.getElementById('trimPitch').textContent = (r.pitch_trim > 0 ? '+' : '') + r.pitch_trim;
       document.getElementById('trimRoll').textContent = (r.roll_trim > 0 ? '+' : '') + r.roll_trim;
     }
+    if (r.video_fps !== undefined) {
+      document.getElementById('videoFps').textContent = r.video_fps;
+      document.getElementById('videoFrames').textContent = r.video_frames_decoded;
+    }
   }
 }, 3000);
 
 // -- Autopilot controls ----------------------------------------------------
 let autopilotActive = false;
-let videoRefreshTimer = null;
 
 function highlightAPBtn(activeId) {
   document.querySelectorAll('.ap-btn').forEach(b => b.classList.remove('active'));
@@ -1269,7 +1425,7 @@ async function setAutopilot(mode) {
       highlightAPBtn('btnAPOff');
       document.getElementById('apStatus').textContent = 'Autopilot off';
       addLog('Autopilot disabled — manual control', 'warn');
-      stopVideoRefresh();
+      stopVideoStream();
     }
   } else {
     const r = await api('autopilot/enable', { mode });
@@ -1277,12 +1433,12 @@ async function setAutopilot(mode) {
       // Enable returns immediately — autopilot starts in background
       autopilotActive = true;
       apPolling = true;
-      highlightAPBtn(mode === 'hover' ? 'btnAPHover' : 'btnAPExplore');
+      highlightAPBtn(mode === 'hover' ? 'btnAPHover' : mode === 'explore' ? 'btnAPExplore' : 'btnAPML');
       document.getElementById('apStatus').textContent = 'Starting...';
       document.getElementById('apEventLog').style.display = 'block';
       document.getElementById('apEventLog').innerHTML = '<div style="color:#888;">Waiting for autopilot events...</div>';
       addLog('Autopilot starting: ' + mode + ' (settling + ramp ~7s)', 'ok');
-      startVideoRefresh();
+      startVideoStream();
     } else {
       addLog('Autopilot error: ' + (r.error || ''), 'error');
     }
@@ -1334,19 +1490,12 @@ async function doTestRamp() {
   }, 500);
 }
 
-function startVideoRefresh() {
-  if (videoRefreshTimer) return;
-  const img = document.getElementById('videoFeed');
-  videoRefreshTimer = setInterval(() => {
-    img.src = '/api/video/frame?' + Date.now();
-  }, 200);  // 5 fps refresh for UI
+function startVideoStream() {
+  document.getElementById('videoFeed').src = '/api/video/stream?' + Date.now();
 }
 
-function stopVideoRefresh() {
-  if (videoRefreshTimer) {
-    clearInterval(videoRefreshTimer);
-    videoRefreshTimer = null;
-  }
+function stopVideoStream() {
+  document.getElementById('videoFeed').src = '';
 }
 
 function updateThreatBar(id, valId, value) {
@@ -1388,7 +1537,7 @@ setInterval(async () => {
     addLog('Autopilot error: ' + r.error, 'error');
     autopilotActive = false;
     highlightAPBtn('btnAPOff');
-    stopVideoRefresh();
+    stopVideoStream();
   } else if (r.starting) {
     document.getElementById('apStatus').textContent =
       'Starting... T=0x' + (r.drone_throttle || 0).toString(16).toUpperCase().padStart(2, '0') +
@@ -1406,7 +1555,7 @@ setInterval(async () => {
     autopilotActive = false;
     highlightAPBtn('btnAPOff');
     document.getElementById('apStatus').style.color = 'var(--muted)';
-    stopVideoRefresh();
+    stopVideoStream();
   }
 }, 500);
 
@@ -1431,6 +1580,186 @@ async function doTrimReset() {
     addLog('Trim reset to zero', 'ok');
   }
 }
+
+// -- ML Behavioral Cloning -------------------------------------------------
+let mlRecording = false;
+let mlSelectedSessions = new Set();
+let mlSelectedModel = null;
+let mlTrainPollTimer = null;
+
+async function mlToggleRecord() {
+  if (mlRecording) {
+    await api('ml/record/stop', {});
+    mlRecording = false;
+    document.getElementById('btnRecord').textContent = 'Record';
+    document.getElementById('btnRecord').className = 'btn btn-sm btn-success';
+    document.getElementById('mlRecordStatus').textContent = 'Stopped';
+    mlRefreshSessions();
+  } else {
+    const name = document.getElementById('mlSessionName').value.trim();
+    if (!name) { addLog('Enter a session name first', 'warn'); return; }
+    const r = await api('ml/record/start', { name });
+    if (r.ok) {
+      mlRecording = true;
+      document.getElementById('btnRecord').textContent = 'Stop';
+      document.getElementById('btnRecord').className = 'btn btn-sm btn-danger';
+      addLog('Recording session: ' + name, 'ok');
+    } else {
+      addLog('Record error: ' + (r.error || ''), 'error');
+    }
+  }
+}
+
+async function mlRefreshSessions() {
+  const r = await api('ml/sessions');
+  const el = document.getElementById('mlSessionsList');
+  if (!r.sessions || r.sessions.length === 0) {
+    el.innerHTML = '<div style="color:var(--muted);">No sessions</div>';
+    return;
+  }
+  el.innerHTML = r.sessions.map(s => {
+    const sel = mlSelectedSessions.has(s.session_name);
+    return '<div style="display:flex; justify-content:space-between; align-items:center; padding:3px 4px; cursor:pointer; border-radius:4px;' +
+           (sel ? ' background:var(--accent); color:#fff;' : '') +
+           '" onclick="mlToggleSession(\\'' + s.session_name + '\\', this)">' +
+           '<span>' + s.session_name + ' (' + s.frame_count + ' frames, ' + s.duration + 's)</span>' +
+           '<span style="cursor:pointer; color:#f55; font-size:14px;" onclick="event.stopPropagation(); mlDeleteSession(\\'' + s.session_name + '\\')">&times;</span>' +
+           '</div>';
+  }).join('');
+}
+
+function mlToggleSession(name, el) {
+  if (mlSelectedSessions.has(name)) {
+    mlSelectedSessions.delete(name);
+    el.style.background = '';
+    el.style.color = '';
+  } else {
+    mlSelectedSessions.add(name);
+    el.style.background = 'var(--accent)';
+    el.style.color = '#fff';
+  }
+}
+
+async function mlDeleteSession(name) {
+  await fetch('/api/ml/sessions/' + name, { method: 'DELETE' });
+  mlSelectedSessions.delete(name);
+  mlRefreshSessions();
+  addLog('Deleted session: ' + name, 'warn');
+}
+
+async function mlStartTrain() {
+  const sessions = Array.from(mlSelectedSessions);
+  if (sessions.length === 0) { addLog('Select sessions first', 'warn'); return; }
+  const r = await api('ml/train', { sessions, name: 'default', epochs: 50 });
+  if (r.ok) {
+    addLog('Training started on ' + sessions.length + ' sessions', 'ok');
+    document.getElementById('btnTrainStop').style.display = '';
+    document.getElementById('mlTrainProgress').style.display = '';
+    mlTrainPollTimer = setInterval(mlPollTrain, 1000);
+  } else {
+    addLog('Train error: ' + (r.error || ''), 'error');
+  }
+}
+
+async function mlStopTrain() {
+  await api('ml/train/stop', {});
+  if (mlTrainPollTimer) { clearInterval(mlTrainPollTimer); mlTrainPollTimer = null; }
+  document.getElementById('btnTrainStop').style.display = 'none';
+  document.getElementById('mlTrainStatus').textContent = 'Stopped';
+  addLog('Training stopped', 'warn');
+}
+
+async function mlPollTrain() {
+  const r = await api('ml/train/status');
+  if (!r.running && mlTrainPollTimer) {
+    clearInterval(mlTrainPollTimer);
+    mlTrainPollTimer = null;
+    document.getElementById('btnTrainStop').style.display = 'none';
+    if (r.error) {
+      document.getElementById('mlTrainStatus').textContent = 'Error: ' + r.error;
+      addLog('Training error: ' + r.error, 'error');
+    } else {
+      document.getElementById('mlTrainStatus').textContent = 'Done! Best val: ' + (r.best_val_loss || '-');
+      addLog('Training complete! Best val loss: ' + r.best_val_loss, 'ok');
+      mlRefreshModels();
+    }
+    return;
+  }
+  const pct = r.total_epochs > 0 ? Math.round(r.epoch / r.total_epochs * 100) : 0;
+  document.getElementById('mlTrainBar').style.width = pct + '%';
+  document.getElementById('mlTrainEpoch').textContent = r.epoch;
+  document.getElementById('mlTrainTotal').textContent = r.total_epochs;
+  document.getElementById('mlTrainLoss').textContent = r.train_loss ? r.train_loss.toFixed(5) : '-';
+  document.getElementById('mlValLoss').textContent = r.val_loss ? r.val_loss.toFixed(5) : '-';
+  const eta = r.eta_s > 0 ? Math.round(r.eta_s) + 's' : '-';
+  document.getElementById('mlTrainStatus').textContent = 'Training... ETA: ' + eta;
+}
+
+async function mlRefreshModels() {
+  const r = await api('ml/models');
+  const el = document.getElementById('mlModelsList');
+  if (!r.models || r.models.length === 0) {
+    el.innerHTML = '<div style="color:var(--muted);">No models</div>';
+    return;
+  }
+  el.innerHTML = r.models.map(m => {
+    const sel = mlSelectedModel === m.name;
+    return '<div style="display:flex; justify-content:space-between; align-items:center; padding:3px 4px; cursor:pointer; border-radius:4px;' +
+           (sel ? ' background:#537; color:#fff;' : '') +
+           '" onclick="mlSelectModel(\\'' + m.name + '\\', this)">' +
+           '<span>' + m.name + ' (val: ' + (m.val_loss ? m.val_loss.toFixed(5) : '?') + ', ' + m.param_count + ' params)</span>' +
+           '<span style="cursor:pointer; color:#f55; font-size:14px;" onclick="event.stopPropagation(); mlDeleteModel(\\'' + m.name + '\\')">&times;</span>' +
+           '</div>';
+  }).join('');
+}
+
+function mlSelectModel(name, el) {
+  el.parentElement.querySelectorAll('div').forEach(d => { d.style.background = ''; d.style.color = ''; });
+  mlSelectedModel = name;
+  el.style.background = '#537';
+  el.style.color = '#fff';
+}
+
+async function mlDeleteModel(name) {
+  await fetch('/api/ml/models/' + name, { method: 'DELETE' });
+  if (mlSelectedModel === name) mlSelectedModel = null;
+  mlRefreshModels();
+  addLog('Deleted model: ' + name, 'warn');
+}
+
+async function mlLoadModel() {
+  if (!mlSelectedModel) { addLog('Select a model first', 'warn'); return; }
+  const r = await api('ml/model/load', { name: mlSelectedModel });
+  if (r.ok) {
+    document.getElementById('mlModelInfo').textContent = 'Loaded: ' + (r.name || mlSelectedModel) + ' (val: ' + (r.val_loss || '?') + ')';
+    addLog('Model loaded: ' + mlSelectedModel, 'ok');
+  } else {
+    addLog('Load error: ' + (r.error || ''), 'error');
+  }
+}
+
+async function mlUnloadModel() {
+  await api('ml/model/unload', {});
+  document.getElementById('mlModelInfo').textContent = 'No model loaded';
+  addLog('Model unloaded', 'warn');
+}
+
+setInterval(async () => {
+  if (!mlRecording) return;
+  const r = await api('ml/record/state');
+  if (r.is_recording) {
+    document.getElementById('mlRecordStatus').textContent =
+      'Recording: ' + r.frame_count + ' frames, ' + r.duration + 's';
+  } else {
+    mlRecording = false;
+    document.getElementById('btnRecord').textContent = 'Record';
+    document.getElementById('btnRecord').className = 'btn btn-sm btn-success';
+    document.getElementById('mlRecordStatus').textContent = 'Stopped';
+  }
+}, 1000);
+
+mlRefreshSessions();
+mlRefreshModels();
 
 addLog('Q10 Controller ready. Connect to drone WiFi, then click Connect.');
 addLog('Keys: W=throttle up, S=throttle down, A/D=yaw, I/K or Arrows=pitch/roll');
@@ -1533,7 +1862,7 @@ def api_trim():
 def api_autopilot_enable():
     data = request.get_json(silent=True) or {}
     mode = data.get("mode", "hover")
-    if mode not in ("hover", "explore"):
+    if mode not in ("hover", "explore", "ml"):
         return jsonify(ok=False, error=f"Unknown mode: {mode}")
     if drone.autopilot.enabled:
         return jsonify(ok=True, mode=mode, status="already_enabled")
@@ -1694,6 +2023,167 @@ def api_video_frame():
                     headers={'Cache-Control': 'no-cache'})
 
 
+@app.route("/api/video/stream")
+def api_video_stream():
+    """MJPEG stream — continuous multipart/x-mixed-replace of JPEG frames."""
+    def generate():
+        while True:
+            frame = drone.video_decoder.wait_frame(0.2)
+            if frame is None:
+                # Generate a "No Video" placeholder
+                frame = np.zeros((240, 320, 3), dtype=np.uint8)
+                cv2.putText(frame, "No Video", (80, 130),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (100, 100, 100), 2)
+
+            # If autopilot has obstacle annotations, overlay those
+            if drone.autopilot.enabled and drone.autopilot.last_obstacle_map:
+                obs_frame = drone.autopilot.last_obstacle_map.annotated_frame
+                if obs_frame is not None:
+                    frame = obs_frame
+
+            _, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' +
+                   jpeg.tobytes() + b'\r\n')
+
+    return Response(generate(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame',
+                    headers={'Cache-Control': 'no-cache, no-store'})
+
+
+# -- ML API routes (optional — all return errors gracefully if ml/ missing) -
+
+@app.route("/api/ml/record/start", methods=["POST"])
+def api_ml_record_start():
+    if ml_collector is None:
+        return jsonify(ok=False, error="ML module not installed")
+    data = request.get_json(silent=True) or {}
+    name = data.get("name", "").strip()
+    if not name:
+        return jsonify(ok=False, error="Session name required")
+    try:
+        ml_collector.start_session(name)
+        return jsonify(ok=True)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e))
+
+
+@app.route("/api/ml/record/stop", methods=["POST"])
+def api_ml_record_stop():
+    if ml_collector is None:
+        return jsonify(ok=False, error="ML module not installed")
+    try:
+        ml_collector.stop_session()
+        return jsonify(ok=True)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e))
+
+
+@app.route("/api/ml/record/state")
+def api_ml_record_state():
+    if ml_collector is None:
+        return jsonify(recording=False, session=None, frames=0)
+    return jsonify(**ml_collector.get_state())
+
+
+@app.route("/api/ml/sessions")
+def api_ml_sessions():
+    if DataCollector is None:
+        return jsonify(sessions=[])
+    return jsonify(sessions=DataCollector.list_sessions())
+
+
+@app.route("/api/ml/sessions/<name>", methods=["DELETE"])
+def api_ml_session_delete(name):
+    if DataCollector is None:
+        return jsonify(ok=False, error="ML module not installed")
+    try:
+        DataCollector.delete_session(name)
+        return jsonify(ok=True)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e))
+
+
+@app.route("/api/ml/train", methods=["POST"])
+def api_ml_train():
+    global ml_trainer
+    from ml.trainer import Trainer
+    data = request.get_json(silent=True) or {}
+    sessions = data.get("sessions", [])
+    if not sessions:
+        return jsonify(ok=False, error="No sessions selected")
+    model_name = data.get("name", "default")
+    epochs = int(data.get("epochs", 50))
+    try:
+        ml_trainer = Trainer(
+            session_names=sessions,
+            model_name=model_name,
+            epochs=epochs,
+        )
+        ml_trainer.start()
+        return jsonify(ok=True)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e))
+
+
+@app.route("/api/ml/train/status")
+def api_ml_train_status():
+    if ml_trainer is None:
+        return jsonify(running=False)
+    return jsonify(**ml_trainer.get_status())
+
+
+@app.route("/api/ml/train/stop", methods=["POST"])
+def api_ml_train_stop():
+    if ml_trainer is not None:
+        ml_trainer.stop()
+    return jsonify(ok=True)
+
+
+@app.route("/api/ml/models")
+def api_ml_models():
+    from ml.trainer import Trainer
+    return jsonify(models=Trainer.list_models())
+
+
+@app.route("/api/ml/model/load", methods=["POST"])
+def api_ml_model_load():
+    data = request.get_json(silent=True) or {}
+    name = data.get("name", "default")
+    from ml.trainer import MODELS_PATH
+    model_path = str(MODELS_PATH / f"{name}.pt")
+    try:
+        pred = _get_predictor()
+        pred.load_model(model_path)
+        return jsonify(ok=True, **pred.get_model_info())
+    except Exception as e:
+        return jsonify(ok=False, error=str(e))
+
+
+@app.route("/api/ml/model/unload", methods=["POST"])
+def api_ml_model_unload():
+    pred = _get_predictor()
+    pred._model = None
+    pred._ema = None
+    return jsonify(ok=True)
+
+
+@app.route("/api/ml/models/<name>", methods=["DELETE"])
+def api_ml_model_delete(name):
+    from ml.trainer import Trainer
+    try:
+        Trainer.delete_model(name)
+        return jsonify(ok=True)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e))
+
+
+@app.route("/api/ml/model/info")
+def api_ml_model_info():
+    pred = _get_predictor()
+    return jsonify(**pred.get_model_info())
+
+
 @app.route("/api/state")
 def api_state():
     return jsonify(**drone.get_state())
@@ -1715,11 +2205,15 @@ if __name__ == "__main__":
     print("=" * 60)
     print()
 
-    # Check network setup
+    # Check network setup (cross-platform: Linux ip addr, macOS ifconfig)
     has_169_3 = False
     has_drone_wifi = False
     try:
-        result = subprocess.run(["ifconfig"], capture_output=True, text=True, timeout=5)
+        # Try 'ip addr' first (Linux/Pi), fall back to 'ifconfig' (macOS)
+        try:
+            result = subprocess.run(["ip", "addr"], capture_output=True, text=True, timeout=5)
+        except FileNotFoundError:
+            result = subprocess.run(["ifconfig"], capture_output=True, text=True, timeout=5)
         for line in result.stdout.split('\n'):
             if "192.168.0." in line:
                 has_drone_wifi = True

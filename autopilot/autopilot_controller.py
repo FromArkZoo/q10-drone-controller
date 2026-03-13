@@ -22,6 +22,11 @@ from typing import Optional
 from .obstacle_detector import ObstacleDetector, ObstacleMap
 from .video_pipeline import VideoDecoder
 
+try:
+    from ml.predictor import Predictor
+except ImportError:
+    Predictor = None
+
 log = logging.getLogger("Q10.autopilot")
 
 # Autopilot runs at 10 Hz (100ms per tick)
@@ -74,6 +79,9 @@ class AutopilotController:
         # Thread
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
+
+        # ML predictor (for "ml" mode)
+        self.predictor = None  # Set externally via set_predictor()
 
         # Stats
         self.ticks = 0
@@ -166,12 +174,15 @@ class AutopilotController:
         print(f"  [2/6] {msg[8:]}")
         self._log_event(msg)
 
-        # Step 3: Skipped — no settle or rearm. Ramp immediately after connect!
-        print("  [3/6] Skipped (ramp immediately — no settle needed)")
-        self._log_event("Step 3: Skipped — ramping immediately")
+        # Step 3: Re-send video start command — drone may not resume video after reconnect
+        print("  [3/6] Re-sending cmd=3 (start video)...")
+        self._log_event("Step 3: Re-sending start video command")
+        self.drone._queue_text_cmd(3)
+        time.sleep(0.1)
+        self.drone._queue_text_cmd(3)  # Send twice for reliability
 
-        # Step 4: Try to start video decoder
-        print("  [4/6] Starting video decoder...")
+        # Step 4: Verify video decoder is running (connect() pre-starts it now)
+        print("  [4/6] Checking video decoder...")
         if not self.video._started:
             try:
                 self.video.start()
@@ -183,20 +194,35 @@ class AutopilotController:
         else:
             print("  [4/6] Video decoder already running")
 
-        # Step 5: LAUNCH — two full-throttle pumps to start motors.
+        # Step 5: Wait for settle period (drone needs 2s of marker-only before joystick)
+        if not self.drone._joystick_active:
+            print("  [5/7] Waiting for joystick settle...")
+            self._log_event("Step 5: Waiting for settle...")
+            settle_start = time.time()
+            while not self.drone._joystick_active and time.time() - settle_start < 3:
+                time.sleep(0.1)
+                if self._stop_event.is_set():
+                    self.starting = False
+                    return
+            print(f"  [5/7] Settle complete (joystick_active={self.drone._joystick_active})")
+            self._log_event("Step 5: Settle complete")
+        else:
+            print("  [5/7] Already settled")
+
+        # Step 6: LAUNCH — two full-throttle pumps to start motors.
         # Pump 1: 0xFF → 0x80, wait 2s, Pump 2: 0xFF → 0x80, then cruise.
-        print(f"  [5/6] LAUNCH: pump 0xFF→0x80, wait 2s, pump 0xFF→0x80...")
-        self._log_event("Step 5: LAUNCH — two pump sequence...")
+        print(f"  [6/7] LAUNCH: pump 0xFF→0x80, wait 2s, pump 0xFF→0x80...")
+        self._log_event("Step 6: LAUNCH — two pump sequence...")
 
         # Pump 1: full throttle then back to center
         self.drone.set_joystick(throttle=0xFF)
-        print(f"  [5/6] Pump 1: T=0xFF")
+        print(f"  [6/7] Pump 1: T=0xFF")
         time.sleep(0.05)
         self.drone.set_joystick(throttle=0x80)
-        print(f"  [5/6] Pump 1: T=0x80")
+        print(f"  [6/7] Pump 1: T=0x80")
 
         # Wait 2 seconds
-        print(f"  [5/6] Waiting 2s...")
+        print(f"  [6/7] Waiting 2s...")
         time.sleep(2.0)
         if self._stop_event.is_set():
             self.starting = False
@@ -204,30 +230,30 @@ class AutopilotController:
 
         # Pump 2: full throttle then back to center
         self.drone.set_joystick(throttle=0xFF)
-        print(f"  [5/6] Pump 2: T=0xFF")
+        print(f"  [6/7] Pump 2: T=0xFF")
         time.sleep(0.05)
         self.drone.set_joystick(throttle=0x80)
-        print(f"  [5/6] Pump 2: T=0x80")
+        print(f"  [6/7] Pump 2: T=0x80")
 
         # Set cruise throttle
         time.sleep(0.5)
         self.drone.set_joystick(throttle=self.cruise_throttle)
-        print(f"  [5/6] Launch complete — cruising at 0x{self.drone.throttle:02X}")
-        self._log_event(f"Step 5: Launch complete — cruise=0x{self.drone.throttle:02X}")
+        print(f"  [6/7] Launch complete — cruising at 0x{self.drone.throttle:02X}")
+        self._log_event(f"Step 6: Launch complete — cruise=0x{self.drone.throttle:02X}")
         log.info("Throttle at cruise: 0x%02X", self.drone.throttle)
 
-        # Step 6: Mark as enabled and start autopilot control loop
+        # Step 7: Mark as enabled and start autopilot control loop
         # Set enabled=True AFTER ramp completes, not before
         self.starting = False
         self.enabled = True
         self._thread = threading.Thread(target=self._control_loop, daemon=True,
                                         name="autopilot")
         self._thread.start()
-        print(f"  [6/6] Autopilot control loop started (mode={mode})")
+        print(f"  [7/7] Autopilot control loop started (mode={mode})")
         print(f"{'='*60}")
         print(f"  AUTOPILOT ENABLED — mode={mode}, cruise=0x{self.cruise_throttle:02X}")
         print(f"{'='*60}\n")
-        self._log_event(f"Step 6: ENABLED (mode={mode}, cruise=0x{self.cruise_throttle:02X})")
+        self._log_event(f"Step 7: ENABLED (mode={mode}, cruise=0x{self.cruise_throttle:02X})")
         log.info("Autopilot ENABLED (mode=%s, cruise_throttle=0x%02X)",
                  mode, self.cruise_throttle)
 
@@ -328,6 +354,8 @@ class AutopilotController:
                     self._tick_hover(obstacle_map)
                 elif self.mode == "explore":
                     self._tick_explore(obstacle_map)
+                elif self.mode == "ml":
+                    self._tick_ml(frame)
 
                 self.ticks += 1
 
@@ -416,6 +444,41 @@ class AutopilotController:
 
         self.drone.set_joystick(roll=roll, pitch=pitch,
                                 throttle=min(throttle, self.max_throttle), yaw=yaw)
+
+    # -- ml mode --------------------------------------------------------------
+
+    def set_predictor(self, predictor):
+        """Set the ML predictor for 'ml' mode."""
+        self.predictor = predictor
+
+    def _tick_ml(self, frame):
+        """ML mode: use trained model predictions for flight control."""
+        if self.predictor is None or not self.predictor.is_loaded:
+            # Fallback to hover if model not loaded
+            self.drone.set_joystick(roll=CENTER, pitch=CENTER,
+                                    throttle=self.cruise_throttle, yaw=CENTER)
+            return
+
+        if frame is None:
+            # No frame available — hold hover
+            self.drone.set_joystick(roll=CENTER, pitch=CENTER,
+                                    throttle=self.cruise_throttle, yaw=CENTER)
+            return
+
+        pred = self.predictor.predict(frame)
+        throttle = pred["throttle"]
+
+        # Safety: cap throttle at max, floor at cruise if below motor threshold
+        throttle = min(throttle, self.max_throttle)
+        if throttle < 0x90:
+            throttle = self.cruise_throttle
+
+        self.drone.set_joystick(
+            roll=pred["roll"],
+            pitch=pred["pitch"],
+            throttle=throttle,
+            yaw=pred["yaw"],
+        )
 
     # -- helpers --------------------------------------------------------------
 

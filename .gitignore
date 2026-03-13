@@ -1,2 +1,9 @@
 *.pyc
 __pycache__/
+data/
+*.pt
+*.pth
+.DS_Store
+.claude/
+.playwright-mcp/
+captures/

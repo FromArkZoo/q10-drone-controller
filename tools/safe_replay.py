@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Replay EXACT stock app packets to the drone and monitor video.
+Safe replay: sends EXACT stock app packet bytes but neutralizes joystick
+values to prevent the drone from taking off.
 
-THE DEFINITIVE TEST: If replaying the iPhone's exact bytes from the Mac
-also gets only ~160 video packets, the issue is Mac WiFi, not protocol.
-
-Usage: python tools/replay_capture.py [pcap_path]
+Modifies ONLY bytes 19-22 (roll/pitch/throttle/yaw) to 0x80 (center)
+in packets that have the 0x66 joystick marker at byte 18.
+All other bytes remain EXACTLY as captured from the stock app.
 """
 import socket
 import struct
@@ -27,7 +27,6 @@ CLIENT_IP = "192.168.169.3"
 
 
 def load_packets(pcap_path):
-    """Load all client→drone packets from pcap."""
     packets = []
     first_ts = None
     with open(pcap_path, 'rb') as f:
@@ -51,7 +50,7 @@ def load_packets(pcap_path):
                         first_ts = ts
                     packets.append({
                         "t": ts - first_ts,
-                        "data": bytes(udp.data),
+                        "data": bytearray(udp.data),  # mutable copy
                         "dport": udp.dport,
                         "sport": udp.sport,
                     })
@@ -60,10 +59,21 @@ def load_packets(pcap_path):
     return packets
 
 
+def neutralize_joystick(data):
+    """Replace joystick values with center (0x80) if 0x66 marker present."""
+    if len(data) > 25 and data[0] == 0xEF and data[1] == 0x02 and data[18] == 0x66:
+        data[19] = 0x80  # roll center
+        data[20] = 0x80  # pitch center
+        data[21] = 0x80  # throttle center
+        data[22] = 0x80  # yaw center
+    return bytes(data)
+
+
 def main():
     # Find pcap
     paths = [sys.argv[1] if len(sys.argv) > 1 else None]
     import glob
+    paths += glob.glob("*.pcap") + glob.glob("*.pcapng")
     paths += glob.glob("captures/*.pcap") + glob.glob("captures/*.pcapng")
     pcap_path = None
     for p in paths:
@@ -78,7 +88,12 @@ def main():
     print(f"Loaded {len(packets)} control packets from {pcap_path}")
     print(f"  Duration: {packets[-1]['t']:.1f}s")
 
-    # Get source ports
+    # Count how many will be neutralized
+    neutralized = sum(1 for p in packets if len(p['data']) > 25
+                      and p['data'][0] == 0xEF and p['data'][1] == 0x02
+                      and p['data'][18] == 0x66)
+    print(f"  Packets with joystick data (will be neutralized): {neutralized}")
+
     sport_8800 = packets[0]["sport"]
     sport_8801 = None
     for p in packets:
@@ -86,16 +101,15 @@ def main():
             sport_8801 = p["sport"]
             break
 
-    print(f"  Stock app port for 8800: {sport_8800}")
-    print(f"  Stock app port for 8801: {sport_8801}")
-
     # Create sockets
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
-    except:
-        pass
+    for buf_size in [4*1024*1024, 2*1024*1024, 1*1024*1024, 512*1024]:
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, buf_size)
+            break
+        except:
+            continue
     sock.settimeout(0.5)
     sock.bind((CLIENT_IP, sport_8800))
     print(f"  Bound to {CLIENT_IP}:{sport_8800}")
@@ -109,9 +123,9 @@ def main():
         except:
             sock2.bind((CLIENT_IP, 0))
             p = sock2.getsockname()[1]
-            print(f"  Bound to {CLIENT_IP}:{p} for 8801 (port differs)")
+            print(f"  Bound to {CLIENT_IP}:{p} for 8801")
 
-    # Video counter (shared with receive thread)
+    # Video counter
     video_count = 0
     other_count = 0
     stop_event = threading.Event()
@@ -145,47 +159,31 @@ def main():
 
     print()
     print("=" * 60)
-    print("  REPLAYING EXACT STOCK APP PACKETS")
+    print("  SAFE REPLAY (joystick neutralized to center)")
     print("=" * 60)
     print()
 
     rx_start[0] = time.time()
     start = time.monotonic()
 
-    # Replay ALL packets with exact timing (up to 20 seconds worth)
-    max_time = 20.0
+    max_time = 40.0
     sent = 0
     for p in packets:
         if p["t"] > max_time:
             break
 
-        # Wait for correct timing
         target = p["t"]
         elapsed = time.monotonic() - start
         wait = target - elapsed
         if wait > 0:
             time.sleep(wait)
 
-        # Send EXACT bytes
-        s = sock if p["dport"] == 8800 else sock2
-        s.sendto(p["data"], (DRONE_IP, p["dport"]))
-        sent += 1
+        # Neutralize joystick but keep ALL other bytes exact
+        safe_data = neutralize_joystick(p["data"])
 
-        # Log key packets
-        d = p["data"]
-        if sent <= 25 or (d[0] == 0xEF and d[1] == 0x20):
-            if len(d) == 4:
-                desc = "HEARTBEAT"
-            elif len(d) == 6:
-                desc = "ENABLE"
-            elif d[1] == 0x20 and len(d) > 6:
-                desc = f"TEXT: {d[6:].decode('ascii', errors='replace')}"
-            else:
-                sub = d[8] if len(d) > 8 else '?'
-                desc = f"CTRL sub={sub} [{len(d)}B]"
-            with lock:
-                v = video_count
-            print(f"  #{sent:4d} +{p['t']:7.3f}s -> :{p['dport']} {desc}  (vid:{v})")
+        s = sock if p["dport"] == 8800 else sock2
+        s.sendto(safe_data, (DRONE_IP, p["dport"]))
+        sent += 1
 
         # Periodic status
         if sent % 100 == 0:
@@ -198,9 +196,9 @@ def main():
         v = video_count
     print(f"\n  Replay complete: sent {sent} packets in {elapsed:.1f}s, video={v}")
 
-    # Continue monitoring for 10 more seconds
-    print(f"\n  Monitoring for 10 more seconds...")
-    for i in range(10):
+    # Monitor for 5 more seconds
+    print(f"\n  Monitoring for 5 more seconds...")
+    for i in range(5):
         time.sleep(1)
         with lock:
             v = video_count
